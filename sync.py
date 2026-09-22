@@ -2,14 +2,14 @@
 """
 GDI Sync System — copia local de los datos de tu municipio.
 
-Copyright (C) 2026 Tecnologia Acuario SAS / Santiago Aranguren
+Copyright (C) 2026 Tecnologia Acuario SAS
 Licenciado bajo AGPL-3.0 — ver LICENSE. Se distribuye SIN NINGUNA GARANTIA.
 
 Descarga los datos del municipio desde el Gateway GDI y los guarda en SQLite local.
 
 Configuracion (.env o variables de entorno):
-  GDI_API_KEY=bk-gdi-sync-...
-  GDI_GATEWAY_URL=https://xxx-gateway.gdilatam.com
+  GDI_API_KEY=sk-gdi-...
+  GDI_GATEWAY_URL=https://tu-municipio-gateway.gdilatam.com
 
 Uso:
   python sync.py            # sync incremental (solo lo que cambio)

@@ -57,11 +57,11 @@ python sync.py --full --pdfs
 
 ```
 GDI Sync System v3.2.0
-  Gateway : https://mi-municipio-gateway.gdilatam.com
+  Gateway : https://tu-municipio-gateway.gdilatam.com
   DB      : backup.db
   Modo    : INCREMENTAL
 
-  Tenant  : 101_municipio
+  Tenant  : 999_municipio
   Tablas  : 36
 
   OK   cases                                      +12 nuevas
