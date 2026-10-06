@@ -53,6 +53,18 @@ python sync.py --pdfs
 python sync.py --full --pdfs
 ```
 
+### Horario
+
+El sync corre **de 15:00 a 22:00 hora de Argentina**, fuera del horario de mayor uso del sistema.
+Si se lo ejecuta fuera de esa franja, avisa «Fuera de horario» y termina sin descargar nada
+(sin error, así un cron no lo toma como falla). Una corrida que empezó dentro de la franja
+termina aunque se pase de las 22:00.
+
+La hora se toma del servidor de GDI, no del reloj de tu PC: aunque tu reloj esté corrido, la
+franja se respeta igual (y el script avisa si la diferencia pasa de 5 minutos).
+
+Para un caso puntual (por ejemplo, a pedido de soporte) se puede forzar con `--fuera-de-horario`.
+
 ### Salida de ejemplo
 
 ```
@@ -83,16 +95,20 @@ El script genera `backup.db`, una base de datos SQLite con todas las tablas de t
 
 ## Automatizar (opcional)
 
-**Linux/Mac — cron** (ejecutar cada hora):
+Programalo dentro de la franja de 15:00 a 22:00 hora de Argentina. Una vez por día alcanza.
+
+**Linux/Mac — cron** (todos los días a las 16:00; ajustá la hora si el servidor no está en hora de Argentina):
 ```
-0 * * * * cd /ruta/gdi-sync-system && python sync.py >> sync.log 2>&1
+0 16 * * * cd /ruta/gdi-sync-system && python sync.py >> sync.log 2>&1
 ```
 
 **Windows — Task Scheduler:**
 1. Abrir Task Scheduler
 2. Crear tarea básica
 3. Acción: `python C:\ruta\gdi-sync-system\sync.py`
-4. Trigger: diario o cada X horas
+4. Trigger: diario, a una hora entre las 15:00 y las 22:00 (hora de Argentina)
+
+Dentro de la franja se puede correr las veces que quieras. El servidor acepta como máximo un pedido por segundo por API Key, así que el script espera entre pedido y pedido (una copia completa tarda al menos un segundo por tabla) y, si igual lo frenan, reintenta solo.
 
 ## Tablas disponibles
 

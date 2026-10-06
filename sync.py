@@ -15,8 +15,12 @@ Uso:
   python sync.py            # sync incremental (solo lo que cambio)
   python sync.py --full     # descarga todo desde cero
   python sync.py --pdfs     # incluye descarga de PDFs firmados
+  python sync.py --fuera-de-horario   # corre aunque este fuera de la franja (soporte)
+
+Franja horaria: el sync corre de 15:00 a 22:00 hora de Argentina. Fuera de
+esa franja avisa y termina sin hacer nada (exit 0).
 """
-__version__ = "3.2.0"
+__version__ = "3.3.1"
 
 import json
 import os
@@ -24,9 +28,12 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 
 # ---------------------------------------------------------------------------
@@ -116,19 +123,104 @@ def check_new_version():
 
 
 # ---------------------------------------------------------------------------
+# Franja horaria
+# ---------------------------------------------------------------------------
+
+# El sync corre de 15:00 a 22:00 hora de Argentina, fuera del horario de mayor
+# uso de los municipios. Es un acuerdo de uso, no un control de seguridad: el
+# servidor no lo exige todavia. Argentina no tiene horario de verano, asi que
+# UTC-3 fijo (zoneinfo necesitaria el paquete tzdata en Windows).
+HORA_ARGENTINA = timezone(timedelta(hours=-3), "ART")
+FRANJA_DESDE = 15  # hora de inicio, inclusive
+FRANJA_HASTA = 22  # hora de fin, exclusive
+
+
+MAX_DESFASE_RELOJ = 300  # segundos de diferencia con el servidor antes de avisar
+
+
+def en_franja(ahora=None):
+    """True si `ahora` (default: ya) cae dentro de la franja, en hora de Argentina."""
+    ahora = (ahora or datetime.now(timezone.utc)).astimezone(HORA_ARGENTINA)
+    return FRANJA_DESDE <= ahora.hour < FRANJA_HASTA
+
+
+def hora_servidor(gateway_url):
+    """Hora del Gateway, del header `Date` de /health (sin API Key, no toca la BD).
+
+    La franja se decide con la hora del servidor y no con la de esta PC: un reloj
+    local corrido haria que el sync caiga siempre fuera de horario sin que nadie
+    lo note. Si el Gateway no responde devuelve None (se usa el reloj local; el
+    sync igual va a fallar despues al pedir los datos).
+    """
+    try:
+        with urllib.request.urlopen(f"{gateway_url}/health", timeout=15) as resp:
+            fecha = resp.headers.get("Date")
+    except urllib.error.HTTPError as e:
+        fecha = e.headers.get("Date")  # un 404/503 tambien trae la hora del servidor
+    except Exception:
+        return None
+    try:
+        hora = parsedate_to_datetime(fecha) if fecha else None
+    except (TypeError, ValueError):
+        return None
+    if hora is not None and hora.tzinfo is None:
+        hora = hora.replace(tzinfo=timezone.utc)  # HTTP Date es GMT por norma
+    return hora
+
+
+# ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
+# El Gateway exige un espaciado minimo entre pedidos de la misma key (la clave
+# que entrega GDI Latam nace con 60/min = 1 pedido por segundo) y contesta 429 con
+# Retry-After al que se adelanta. Hasta 3.2.0 el cliente pedia una tabla atras
+# de otra sin esperar y no reintentaba: una tabla que respondia en menos de un
+# segundo hacia fallar a la siguiente con ERR.
+MIN_INTERVAL = float(os.environ.get("GDI_MIN_INTERVAL", "1.1"))  # segundos entre pedidos al Gateway
+MAX_RETRIES_429 = 8
+MAX_WAIT_429 = 120  # techo por espera, por si el servidor manda un Retry-After absurdo
+
+# El Gateway entrega como maximo 50 filas/documentos por pagina (pedir mas no
+# trae mas, solo hace creer que se pidio mas).
+PAGE_SIZE = 50
+# Los links de PDF que da /sync/documents vencen a los 600 s: pasado este
+# margen se pide la pagina de nuevo antes de seguir bajando.
+URL_REFRESH_AFTER = 480
+
+_last_request_at = 0.0
+
+
+def _wait_interval():
+    global _last_request_at
+    espera = _last_request_at + MIN_INTERVAL - time.monotonic()
+    if espera > 0:
+        time.sleep(espera)
+    _last_request_at = time.monotonic()
+
+
+def _retry_after_seconds(e):
+    try:
+        return min(max(float(e.headers.get("Retry-After", "1")), 1.0), MAX_WAIT_429)
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def api_get(url, api_key, timeout=30):
     req = urllib.request.Request(url, headers={"X-API-Key": api_key})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        raise RuntimeError(f"HTTP {e.code} en {url}: {body}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Error de conexion en {url}: {e.reason}")
+    for intento in range(MAX_RETRIES_429 + 1):
+        _wait_interval()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 429 and intento < MAX_RETRIES_429:
+                time.sleep(_retry_after_seconds(e))
+                continue
+            raise RuntimeError(f"HTTP {e.code} en {url}: {body}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Error de conexion en {url}: {e.reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +237,7 @@ def init_db(db_path):
     # RENAME/DROP) sea transaccional de verdad: con el isolation_level por
     # defecto de sqlite3, el modulo hace un COMMIT implicito antes de cualquier
     # DDL y lo corre en autocommit SIEMPRE, aunque uno llame a conn.rollback()
-    # despues (bug real detectado en revision: C10 del crack de PLAN-5).
+    # despues.
     conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -275,7 +367,7 @@ def _ensure_schema(conn, table_name, sample_row):
     es DDL puro y es idempotente (una re-ejecucion no encuentra nada para hacer,
     o solo agrega columnas realmente nuevas), asi que queda COMMITEADA antes de
     que arranque la transaccion de datos: un fallo posterior en los datos jamas
-    puede dejar el DDL a medio camino (C10 del crack de PLAN-5).
+    puede dejar el DDL a medio camino.
     """
     conn.execute("BEGIN")
     try:
@@ -351,7 +443,6 @@ def sync_table(conn, table_name, since, gateway_url, api_key):
        hecho y sigue directo a datos.
     """
     page = 1
-    page_size = 100
     new_rows = 0
     sync_time = datetime.now(timezone.utc).isoformat()
     table_ready = False  # _ensure_schema se llama una unica vez, con la 1ra pagina con datos
@@ -359,9 +450,12 @@ def sync_table(conn, table_name, since, gateway_url, api_key):
     try:
         conn.execute("BEGIN")
         while True:
+            # `since` va codificado: el watermark guardado termina en "+00:00" y un
+            # "+" crudo en la query llega al servidor como espacio (400 en TODO
+            # sync incremental hasta 3.2.0).
             url = (
                 f"{gateway_url}/api/v1/sync/data"
-                f"?table={table_name}&since={since}&page={page}&page_size={page_size}"
+                f"?table={table_name}&since={urllib.parse.quote(since, safe='')}&page={page}&page_size={PAGE_SIZE}"
             )
             data = api_get(url, api_key)
             rows = data.get("rows", [])
@@ -390,42 +484,64 @@ def sync_table(conn, table_name, since, gateway_url, api_key):
     return new_rows
 
 
+def _documents_page(gateway_url, api_key, since, page):
+    url = (
+        f"{gateway_url}/api/v1/sync/documents"
+        f"?since={urllib.parse.quote(since, safe='')}&page={page}&page_size={PAGE_SIZE}"
+    )
+    return api_get(url, api_key), time.monotonic()
+
+
 def sync_documents(conn, since, gateway_url, api_key, pdf_dir):
-    """Descarga PDFs firmados y los guarda en pdf_dir."""
+    """Descarga PDFs firmados y los guarda en pdf_dir.
+
+    Los links de descarga vencen a los 10 minutos de pedida la pagina: si bajar
+    la pagina se estira mas de URL_REFRESH_AFTER, se vuelve a pedir la misma
+    pagina para tener links nuevos. Si algun PDF falla, el watermark NO avanza:
+    la proxima corrida lo vuelve a intentar (los ya bajados se saltean).
+    """
     os.makedirs(pdf_dir, exist_ok=True)
     page = 1
-    page_size = 100
     downloaded = 0
+    failed = 0
     sync_time = datetime.now(timezone.utc).isoformat()
 
     while True:
-        url = (
-            f"{gateway_url}/api/v1/sync/documents"
-            f"?since={since}&page={page}&page_size={page_size}"
-        )
-        data = api_get(url, api_key)
-        docs = data.get("documents", [])
+        data, fetched_at = _documents_page(gateway_url, api_key, since, page)
 
-        for doc in docs:
+        for doc in data.get("documents", []):
             official_number = doc.get("official_number", "")
-            pdf_url = doc.get("pdf_download_url")
-            if not pdf_url:
-                continue
             dest = os.path.join(pdf_dir, f"{official_number}.pdf")
             if os.path.exists(dest):
                 continue
+            if time.monotonic() - fetched_at > URL_REFRESH_AFTER:
+                data, fetched_at = _documents_page(gateway_url, api_key, since, page)
+                fresh = {d.get("official_number"): d for d in data.get("documents", [])}
+                doc = fresh.get(official_number, doc)
+            pdf_url = doc.get("pdf_download_url")
+            if not pdf_url:
+                continue
+            # Se escribe a .part y se renombra al final: una descarga cortada no
+            # deja un PDF a medias que las corridas siguientes darian por bajado.
+            tmp = dest + ".part"
             try:
                 with urllib.request.urlopen(pdf_url, timeout=60) as resp:
-                    with open(dest, "wb") as f:
+                    with open(tmp, "wb") as f:
                         f.write(resp.read())
+                os.replace(tmp, dest)
                 downloaded += 1
             except Exception as e:
+                failed += 1
+                if os.path.exists(tmp):
+                    os.remove(tmp)
                 print(f"  WARN  {official_number:<40} no se pudo descargar: {e}")
 
         if not data.get("has_more", False):
             break
         page += 1
 
+    if failed:
+        raise RuntimeError(f"{failed} PDF(s) sin descargar; se reintentan en la proxima corrida")
     # save_sync_state ejecuta un solo statement (INSERT OR REPLACE) fuera de
     # cualquier BEGIN explicito: bajo isolation_level=None se autocommitea solo.
     save_sync_state(conn, "_documents", sync_time, downloaded)
@@ -435,6 +551,7 @@ def sync_documents(conn, since, gateway_url, api_key, pdf_dir):
 def main():
     full_sync = "--full" in sys.argv
     with_pdfs = "--pdfs" in sys.argv
+    fuera_de_horario = "--fuera-de-horario" in sys.argv
 
     config = load_config()
     pdf_dir = config.get("pdf_dir", "pdfs")
@@ -451,6 +568,24 @@ def main():
     if with_pdfs:
         modos.append("con PDFs")
     print(f"  Modo    : {' + '.join(modos) if modos else 'INCREMENTAL'}\n")
+
+    # Antes de tocar nada: un --full fuera de horario no tiene que borrar _sync_meta.
+    # Solo se mira al arrancar; una corrida empezada dentro de la franja termina igual.
+    ahora_srv = hora_servidor(config["gateway_url"])
+    if ahora_srv is None:
+        print("  AVISO   : no se pudo leer la hora del servidor; se usa el reloj de esta PC.")
+    else:
+        desfase = (datetime.now(timezone.utc) - ahora_srv).total_seconds()
+        if abs(desfase) > MAX_DESFASE_RELOJ:
+            print(f"  AVISO   : el reloj de esta PC difiere {int(abs(desfase)) // 60} min del "
+                  f"servidor; para la franja horaria se usa la hora del servidor.")
+    if not en_franja(ahora_srv):
+        if not fuera_de_horario:
+            ahora = (ahora_srv or datetime.now(timezone.utc)).astimezone(HORA_ARGENTINA).strftime("%H:%M")
+            print(f"  Fuera de horario ({ahora} hora de Argentina). El sync corre de "
+                  f"{FRANJA_DESDE}:00 a {FRANJA_HASTA}:00. No se descargo nada.\n")
+            return
+        print("  AVISO   : corriendo fuera de la franja horaria (--fuera-de-horario).\n")
 
     if full_sync:
         conn.execute("DELETE FROM _sync_meta")  # autocommit (isolation_level=None), sin BEGIN abierto
